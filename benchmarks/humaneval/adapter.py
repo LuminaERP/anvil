@@ -66,10 +66,13 @@ class HumanEvalAdapter(BenchmarkAdapter):
 
                 goal = (
                     f"Complete the Python function `{entry_point}` described by the "
-                    f"docstring below. Write the implementation to ./solution.py. "
-                    f"The file must contain the ENTIRE function (signature + body) so "
+                    f"docstring below. Write the implementation to the file named "
+                    f"exactly `solution.py` in the current working directory (NOT "
+                    f"/workspace/solution.py — use the relative path `solution.py`). "
+                    f"The file must contain the ENTIRE function (signature + body), plus "
+                    f"any imports the implementation needs (at the top of the file), so "
                     f"it imports cleanly. Do not write any other code — no examples, "
-                    f"no __main__ block, no print statements. Match the docstring exactly.\n\n"
+                    f"no __main__ block, no print statements.\n\n"
                     f"```python\n{prompt}\n```"
                 )
 
@@ -83,13 +86,14 @@ class HumanEvalAdapter(BenchmarkAdapter):
 
     # ------- extract -------
     def extract_prediction(self, task: Task, workspace: Path, run_stats: dict[str, Any]) -> Prediction:
-        sol_path = workspace / "solution.py"
-        if not sol_path.exists():
-            return Prediction(task_id=task.id, prediction={"completion": ""},
-                              error="no solution.py produced")
+        entry_point = task.metadata["entry_point"]
+        sol_path = _locate_solution(workspace, entry_point)
+        if sol_path is None:
+            return Prediction(task_id=task.id, prediction={"task_id": task.id, "completion": ""},
+                              error="no solution.py produced (checked workspace + *.py)")
 
         content = sol_path.read_text(encoding="utf-8", errors="replace")
-        completion = _extract_body(content, task.payload["prompt"], task.metadata["entry_point"])
+        completion = _extract_body(content, task.payload["prompt"], entry_point)
 
         return Prediction(
             task_id=task.id,
@@ -103,10 +107,11 @@ class HumanEvalAdapter(BenchmarkAdapter):
         samples_path = out_dir / "samples.jsonl"
         _convert_predictions_to_samples(predictions_path, samples_path)
 
-        # Official grader
+        # Official grader — use absolute path so cwd doesn't matter
+        samples_abs = samples_path.resolve()
         proc = subprocess.run(
-            [sys.executable, "-m", "human_eval.evaluate_functional_correctness", str(samples_path)],
-            capture_output=True, text=True, cwd=str(out_dir),
+            [sys.executable, "-m", "human_eval.evaluate_functional_correctness", str(samples_abs)],
+            capture_output=True, text=True, cwd=str(out_dir.resolve()),
         )
         if proc.returncode != 0:
             return {
@@ -150,23 +155,39 @@ def _download(url: str, dest: Path) -> None:
 
 
 def _extract_body(solution: str, prompt: str, entry_point: str) -> str:
-    """Isolate just the body (below the signature) from whatever the agent wrote.
+    """Isolate completion text that, concatenated after the prompt, produces a
+    valid Python program.
 
-    The grader concatenates prompt + completion, so completion must be just the
-    body — not another copy of the signature. We try hard to handle agents that
-    produced either pattern.
+    The HumanEval grader executes `prompt + completion`. The prompt already
+    contains the function signature + docstring. We want the completion to be:
+
+      - any imports the solution added at module level (converted to imports
+        INSIDE the function so they land under the signature when concatenated)
+      - the function body (lines below the `def ...:` line)
+
+    We stop before any second top-level `def`/`class` to exclude extra helpers
+    the model may have added below.
     """
-    # If the solution already starts with a full function (signature + body), strip
-    # everything up to and including the signature line, return the body.
+    # Extract module-level imports (lines starting with 'import' or 'from')
+    # that appear ABOVE the target signature line. These would be lost if we
+    # only took the body, so we re-emit them as indented imports inside the
+    # function.
     signature_line = f"def {entry_point}("
     idx = solution.find(signature_line)
+
+    imports_to_inject: list[str] = []
+    if idx > 0:
+        preamble = solution[:idx]
+        for line in preamble.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith(("import ", "from ")):
+                imports_to_inject.append("    " + stripped)
+
     if idx >= 0:
-        # Find end of signature (first line ending with ':')
         after_sig = solution[idx:]
         colon = after_sig.find(":\n")
         if colon > 0:
             body_plus = after_sig[colon + 2:]
-            # Body only — stop before any second top-level definition
             body_lines = []
             for line in body_plus.split("\n"):
                 stripped = line.lstrip()
@@ -174,10 +195,37 @@ def _extract_body(solution: str, prompt: str, entry_point: str) -> str:
                 if line and not line.startswith((" ", "\t")) and stripped and not stripped.startswith("#"):
                     break
                 body_lines.append(line)
-            return "\n".join(body_lines).rstrip() + "\n"
+            body = "\n".join(body_lines).rstrip() + "\n"
+            if imports_to_inject:
+                body = "\n".join(imports_to_inject) + "\n" + body
+            return body
 
     # Fallback: assume the whole file IS the body
     return solution
+
+
+def _locate_solution(workspace: Path, entry_point: str) -> Path | None:
+    """Find the solution file across common places the agent might write to.
+
+    1. <workspace>/solution.py                (the intended location)
+    2. <workspace>/*.py containing `def <entry_point>(`   (any stray filename)
+    3. /workspace/solution.py                 (legacy location — only as fallback
+       when the task workspace has nothing; race-prone but better than nothing)
+    """
+    primary = workspace / "solution.py"
+    if primary.exists():
+        return primary
+
+    # Scan for any .py file in workspace that defines the entry point
+    for candidate in workspace.glob("*.py"):
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if f"def {entry_point}(" in text:
+            return candidate
+
+    return None
 
 
 def _convert_predictions_to_samples(predictions_path: Path, samples_path: Path) -> None:

@@ -6,11 +6,19 @@ Runs after a batch of executor work. Reviews outcomes and:
   2. Decides: done? keep going? stuck (→ replan)?
   3. If everything succeeded and produced a clean artifact, can promote
      the action sequence to a Skill in the library.
+
+Hardened with automatic docstring-example verification: if the executor wrote
+Python files with docstring examples (>>>  or `f(x) == expected` patterns) in
+this batch, we run those examples. A "done" verdict with failing examples gets
+auto-overridden to "continue" with a structured failure report attached.
 """
 from __future__ import annotations
 import datetime
 import json
+import logging
+import os
 import re
+from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
@@ -18,6 +26,9 @@ from openai import OpenAI
 from ..config import CONFIG
 from ..state import AgentState, HistoryEvent, Lesson
 from ..memory import Memory, SkillLibrary, Skill, SkillStep
+from ..safety.doctest_check import find_examples, run_examples, VerificationReport
+
+logger = logging.getLogger(__name__)
 
 
 _SYSTEM_PROMPT = """You are the Reflector — a STRICT quality gate on an autonomous coding agent.
@@ -29,8 +40,8 @@ Produce a JSON object:
   "verdict": "continue" | "done" | "stuck",
   "reason":  "one-sentence explanation",
   "completeness": {
-    "target_count": int | null,        // if goal specifies a count, put it here; else null
-    "actual_count": int | null,        // how many of the target were actually completed
+    "target_count": int | null,
+    "actual_count": int | null,
     "target_basis": "short quote from goal that expresses the count"
   },
   "lessons": [
@@ -56,9 +67,10 @@ QUALITY CHECKS — use "continue" (not "done") if ANY fail:
   5. If a BUG was claimed fixed: was the fix actually written to the file, and was verification attempted (re-read or run test)? Otherwise NOT done.
   6. Does the executor's final text contain `<tool_call>` or `<function=` tags? That's a hallucinated tool-call as text — NOT done; treat as needing another execution pass.
   7. Did the ruff or regression gate fire (message contains "ROLLED BACK" or "STATIC-ANALYSIS FAILURE" or "TEST REGRESSION DETECTED")? That's an automatic "continue" — the edit was reverted.
+  8. Did docstring verification fail (message contains "VERIFICATION FAILURE")? Automatic "continue" — code contradicts its own contract.
 
 Verdict rules:
-  - "done" only if the goal is genuinely satisfied per checks 1-7 above AND completeness target is met (if specified).
+  - "done" only if the goal is genuinely satisfied per checks 1-8 above AND completeness target is met (if specified).
   - "stuck" if the SAME failure recurs OR two consecutive subgoals fail for related reasons. Triggers a replan.
   - "continue" in all other cases.
 
@@ -91,10 +103,129 @@ def _format_subgoals(subgoals) -> str:
     return "\n\n".join(parts)
 
 
+# ---- docstring-verification gate --------------------------------------------
+
+_WRITE_TOOLS = {"write_file", "edit_file", "apply_patch", "pskit_write_file", "pskit_edit_file"}
+
+
+def _recent_py_writes(state: AgentState) -> list[Path]:
+    """Collect .py files written or edited in this executor batch.
+
+    We inspect the most recent tool calls (not the entire history — the gate
+    targets THIS batch's output, not earlier artefacts).
+    """
+    workspace = Path(os.environ.get("AGENT_WORKSPACE", "."))
+    paths: list[Path] = []
+    seen: set[Path] = set()
+
+    for tc in state.get("last_tool_calls", []) or []:
+        name = getattr(tc, "name", None) or (tc.get("name") if isinstance(tc, dict) else None)
+        args = getattr(tc, "args", None) or (tc.get("args", {}) if isinstance(tc, dict) else {})
+        if name not in _WRITE_TOOLS:
+            continue
+        if not isinstance(args, dict):
+            continue
+        path_arg = args.get("path") or args.get("file_path") or args.get("target")
+        if not path_arg:
+            continue
+        p = Path(path_arg)
+        if not p.is_absolute():
+            p = workspace / p
+        if p.suffix != ".py":
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        if p.exists():
+            paths.append(p)
+
+    return paths
+
+
+def _verify_written_code(state: AgentState) -> tuple[list[dict], list[HistoryEvent]]:
+    """Run docstring verification on every .py file written in this batch.
+
+    Returns (failures, events) where:
+      - failures is a list of dicts describing files with failing examples
+        (empty if all files pass or have no examples)
+      - events are HistoryEvents to append to the state history
+    """
+    failures: list[dict] = []
+    events: list[HistoryEvent] = []
+
+    for path in _recent_py_writes(state):
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            logger.debug("doctest gate: could not read %s: %s", path, e)
+            continue
+
+        try:
+            examples = find_examples(source)
+        except Exception as e:
+            logger.debug("doctest gate: parse failed for %s: %s", path, e)
+            continue
+
+        if not examples:
+            continue
+
+        try:
+            report: VerificationReport = run_examples(path, examples, timeout_sec=10.0)
+        except Exception as e:
+            logger.warning("doctest gate: run_examples crashed for %s: %s", path, e)
+            continue
+
+        if report.ok:
+            events.append(HistoryEvent(
+                kind="verification",
+                content=f"[verify] {path.name}: {report.passed}/{report.total} examples passed",
+                data={"path": str(path), "total": report.total, "passed": report.passed},
+                timestamp=_now(),
+            ))
+            continue
+
+        # Verification failed — build structured failure payload
+        failed_examples = [
+            {
+                "source": r.example.source,
+                "expected": r.example.expected,
+                "actual": r.actual,
+                "error": r.error,
+                "kind": r.example.kind,
+            }
+            for r in report.results if not r.passed
+        ]
+        failures.append({
+            "path": str(path),
+            "entry_point": report.entry_point,
+            "total": report.total,
+            "passed": report.passed,
+            "failed_examples": failed_examples,
+            "broken_code": source[:4000],
+            "report_summary": report.summary(),
+        })
+        events.append(HistoryEvent(
+            kind="verification",
+            content=f"VERIFICATION FAILURE in {path.name}: {len(failed_examples)}/{report.total} examples failed",
+            data={
+                "path": str(path),
+                "failed_count": len(failed_examples),
+                "total": report.total,
+                "summary": report.summary(max_failures=3),
+            },
+            timestamp=_now(),
+        ))
+
+    return failures, events
+
+
 def reflector_node(state: AgentState) -> dict:
     fleet = CONFIG["fleet"]
     client = OpenAI(base_url=fleet.reflector.base_url, api_key="EMPTY")
     subgoals = state.get("subgoals") or []
+
+    # --- pre-verdict: run docstring verification on this batch's writes ---
+    verification_failures, verification_events = _verify_written_code(state)
 
     user = (
         f"ORIGINAL GOAL:\n{state['goal']}\n\n"
@@ -103,6 +234,12 @@ def reflector_node(state: AgentState) -> dict:
         f"ITERATION: {state.get('iterations', 0)}\n"
         f"CONSECUTIVE FAILURES: {state.get('consecutive_failures', 0)}"
     )
+    if verification_failures:
+        ver_block_lines = ["\nDOCSTRING VERIFICATION — FAILURES DETECTED:"]
+        for vf in verification_failures:
+            ver_block_lines.append(f"  - {vf['path']}: {len(vf['failed_examples'])}/{vf['total']} examples failed")
+            ver_block_lines.append("    " + vf["report_summary"].replace("\n", "\n    "))
+        user = user + "\n" + "\n".join(ver_block_lines)
 
     r = client.chat.completions.create(
         model=fleet.reflector.name,
@@ -117,10 +254,11 @@ def reflector_node(state: AgentState) -> dict:
     try:
         parsed = _extract_json(raw)
     except Exception as e:
-        # Conservative fallback: continue, no lessons
         return {
             "status": "executing",
-            "history": [HistoryEvent(kind="reflection", content=f"parse failed: {e}", data={"raw": raw[:400]}, timestamp=_now())],
+            "history": verification_events + [
+                HistoryEvent(kind="reflection", content=f"parse failed: {e}", data={"raw": raw[:400]}, timestamp=_now())
+            ],
         }
 
     verdict = parsed.get("verdict", "continue")
@@ -139,26 +277,34 @@ def reflector_node(state: AgentState) -> dict:
                       f"only {ac} delivered. Need to finish the remaining {tc - ac}.")
     except Exception:
         pass
+
+    # ENFORCE verification override: if any docstring-example verification failed, block "done"
+    if verification_failures and verdict == "done":
+        verdict = "continue"
+        first = verification_failures[0]
+        reason = (
+            f"docstring verification override: {first['path']} has "
+            f"{len(first['failed_examples'])}/{first['total']} failing examples. "
+            f"The code contradicts its own docstring contract. Fix the implementation."
+        )
     lesson_objs = [
         Lesson(text=l.get("text", ""), severity=l.get("severity", "info"), tags=list(l.get("tags") or []))
         for l in parsed.get("lessons", []) if l.get("text")
     ]
 
-    # Persist lessons
     mem = Memory()
     session_id = state.get("session_id", "unknown")
     for l in lesson_objs:
         try:
             mem.add_lesson(session_id, l)
         except Exception:
-            pass  # don't derail the agent on memory errors
+            pass
 
     # Maybe promote a skill
     sk = parsed.get("save_as_skill")
     skill_event = None
     if sk and verdict == "done":
         try:
-            # Build Skill from successful subgoals + their tool call patterns
             steps: list[SkillStep] = []
             for tc in state.get("last_tool_calls", []):
                 if tc.error is None:
@@ -181,14 +327,13 @@ def reflector_node(state: AgentState) -> dict:
     elif verdict == "done":
         new_failures = 0
 
-    events = [
-        HistoryEvent(
-            kind="reflection",
-            content=f"[{verdict}] {reason}",
-            data={"verdict": verdict, "lessons_added": len(lesson_objs)},
-            timestamp=_now(),
-        )
-    ]
+    events = list(verification_events)
+    events.append(HistoryEvent(
+        kind="reflection",
+        content=f"[{verdict}] {reason}",
+        data={"verdict": verdict, "lessons_added": len(lesson_objs), "verification_failures": len(verification_failures)},
+        timestamp=_now(),
+    ))
     for l in lesson_objs:
         events.append(HistoryEvent(kind="lesson", content=l.text, data={"severity": l.severity, "tags": l.tags}, timestamp=_now()))
     if skill_event:
@@ -200,7 +345,6 @@ def reflector_node(state: AgentState) -> dict:
     elif verdict == "stuck":
         next_status = "replanning"
     else:
-        # Still work pending — if subgoals remain, go back to executor; else also "done" by exhaustion
         from .executor import _pick_next_subgoal
         next_status = "executing" if _pick_next_subgoal(subgoals) is not None else "done"
 
@@ -211,6 +355,10 @@ def reflector_node(state: AgentState) -> dict:
         "lessons": lesson_objs,
         "history": events,
     }
+    # Expose verification failures on the state so retrospective can mine them
+    if verification_failures:
+        out["verification_failures"] = verification_failures
+
     if next_status == "done":
         out["final_answer"] = _synthesize_final(state, subgoals, reason)
     return out

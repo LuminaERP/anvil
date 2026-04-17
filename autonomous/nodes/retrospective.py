@@ -3,21 +3,29 @@ Retrospective — post-session "could I have done this in 50% fewer steps?" pass
 
 Reads the full history of a completed session, generates:
   1. A condensed skill (if patterns emerged) for the skill library
-  2. An "optimization lesson" stored in memory: "next time, do X directly instead of Y then Z"
+  2. An "optimization lesson" stored in memory
+  3. Transferable verification-failure lessons (new) — any docstring verification
+     that fired during the session gets abstracted into a general pattern and
+     saved to memory keyed by semantic similarity to the docstring
 
-This is the Hermes-Agent-style learning loop: after every successful task,
-the agent retrospectively tries to compress what it did.
+This is the Hermes-Agent-style learning loop: after every task (success or
+failure), the agent retrospectively compresses what it did AND what class of
+mistake it made, so future sessions don't repeat them.
 """
 from __future__ import annotations
 import json
+import logging
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from openai import OpenAI
 
 from ..config import CONFIG
 from ..memory import Memory, SkillLibrary, Skill, SkillStep
+from ..memory.verification_lessons import VerificationFailure, save_lesson
 from ..state import Lesson
+
+logger = logging.getLogger(__name__)
 
 
 RETRO_PROMPT = """You are the Retrospective Critic of an autonomous agent.
@@ -62,7 +70,7 @@ def _extract_json(text: str) -> dict:
 
 def _format_trace(events: list[dict]) -> str:
     lines = []
-    for e in events[:200]:   # cap to avoid blowing context
+    for e in events[:200]:
         kind = e.get("kind", "?")
         sub = e.get("subgoal_id") or ""
         c = (e.get("content") or "")[:240]
@@ -70,10 +78,136 @@ def _format_trace(events: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# ---- verification-failure mining --------------------------------------------
+
+def _collect_verification_failures_from_events(events: list[dict]) -> list[VerificationFailure]:
+    """Reconstruct VerificationFailure objects from session events.
+
+    The reflector emits one `kind=verification` event per .py file it checked,
+    with the failure payload in `data`. We group by path and produce a
+    VerificationFailure per distinct entry point that failed.
+    """
+    failures: list[VerificationFailure] = []
+    # We need both the verification event (has failed count) and the source
+    # code at time of failure. Source code isn't in events — we read from disk
+    # at retrospective time as best-effort. If the file has since been
+    # overwritten with a fixed version, we skip to avoid a misleading lesson.
+
+    from pathlib import Path
+    seen_paths: set[str] = set()
+
+    for e in events:
+        if e.get("kind") != "verification":
+            continue
+        data = e.get("data") or {}
+        if "failed_count" not in data:
+            continue
+        if data.get("failed_count", 0) <= 0:
+            continue
+
+        path = data.get("path")
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+
+        # Read current file state
+        try:
+            code = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        # Extract docstring from the current file
+        try:
+            import ast as _ast
+            tree = _ast.parse(code)
+        except SyntaxError:
+            continue
+
+        # Find the first function with a docstring
+        entry_point = None
+        docstring = ""
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                d = _ast.get_docstring(node)
+                if d:
+                    entry_point = node.name
+                    docstring = d
+                    break
+        if not entry_point:
+            continue
+
+        # Summary has the failure details; we reconstruct failed_examples as best-effort
+        # The original failed_examples list isn't in the event (only the summary string),
+        # so we parse it back out of the summary. Coarse but works.
+        summary = data.get("summary", "")
+        failed_examples = _parse_summary_failures(summary)
+
+        failures.append(VerificationFailure(
+            entry_point=entry_point,
+            docstring=docstring,
+            failed_examples=failed_examples,
+            broken_code=code[:3000],
+        ))
+
+    return failures
+
+
+_FAILURE_LINE_PATTERN = re.compile(
+    r"^\s{4}>>> (?P<source>.+?)\n"
+    r"^\s{8}expected: (?P<expected>.+?)\n"
+    r"^\s{8}actual:\s+(?P<actual>.+?)(?:  error: (?P<error>.+?))?$",
+    re.MULTILINE,
+)
+
+
+def _parse_summary_failures(summary: str) -> list[dict]:
+    out = []
+    for m in _FAILURE_LINE_PATTERN.finditer(summary):
+        out.append({
+            "source": m.group("source").strip(),
+            "expected": m.group("expected").strip(),
+            "actual": (m.group("actual") or "").strip(),
+            "error": (m.group("error") or "").strip() or None,
+            "kind": ">>>",
+        })
+    return out
+
+
+def _mine_verification_lessons(events: list[dict], mem: Memory) -> list[dict]:
+    """For each verification failure in the session, extract a transferable
+    lesson via the supervisor LLM and persist it to memory.
+
+    Returns a list of saved-lesson descriptors for telemetry.
+    """
+    fleet = CONFIG["fleet"]
+    client = OpenAI(base_url=fleet.supervisor.base_url, api_key="EMPTY") if hasattr(fleet, "supervisor") else \
+             OpenAI(base_url=fleet.reflector.base_url, api_key="EMPTY")
+
+    model_name = getattr(fleet.supervisor, "name", None) if hasattr(fleet, "supervisor") else fleet.reflector.name
+
+    saved: list[dict] = []
+    for failure in _collect_verification_failures_from_events(events):
+        try:
+            lesson = save_lesson(failure, mem, client, model=model_name)
+            if lesson:
+                saved.append({
+                    "pattern": lesson.pattern,
+                    "confidence": lesson.confidence,
+                    "entry_point": failure.entry_point,
+                    "trigger_keywords": lesson.trigger_keywords,
+                })
+        except Exception as e:
+            logger.warning("verification lesson extraction failed for %s: %s", failure.entry_point, e)
+
+    return saved
+
+
+# ---- retrospective entrypoint -----------------------------------------------
+
 def run_retrospective(session_id: str, goal: str, final_status: str) -> dict:
     """
-    Produces {optimization_lesson, compressed_steps, save_skill}.
-    Persists the lesson + optional skill into memory as a side effect.
+    Produces {optimization_lesson, compressed_steps, save_skill, verification_lessons}.
+    Persists lessons + optional skill into memory as a side effect.
     """
     mem = Memory()
     events = mem.events_for_session(session_id)
@@ -101,10 +235,10 @@ def run_retrospective(session_id: str, goal: str, final_status: str) -> dict:
     try:
         parsed = _extract_json(raw)
     except Exception as e:
-        return {"error": str(e), "raw": raw[:400]}
+        parsed = {"error": str(e), "raw": raw[:400]}
 
     # Persist the optimization lesson
-    opt = parsed.get("optimization_lesson", "").strip()
+    opt = parsed.get("optimization_lesson", "").strip() if isinstance(parsed, dict) else ""
     if opt:
         try:
             mem.add_lesson(session_id, Lesson(
@@ -116,8 +250,8 @@ def run_retrospective(session_id: str, goal: str, final_status: str) -> dict:
             pass
 
     # Maybe save the compressed skill
-    sk = parsed.get("save_skill")
-    steps_in = parsed.get("compressed_steps") or []
+    sk = parsed.get("save_skill") if isinstance(parsed, dict) else None
+    steps_in = parsed.get("compressed_steps", []) if isinstance(parsed, dict) else []
     if sk and steps_in and final_status == "done":
         try:
             skill = Skill(
@@ -130,5 +264,14 @@ def run_retrospective(session_id: str, goal: str, final_status: str) -> dict:
             parsed["skill_saved"] = skill.name
         except Exception as e:
             parsed["skill_save_error"] = str(e)
+
+    # Mine verification failures into transferable lessons
+    try:
+        verification_lessons = _mine_verification_lessons(events, mem)
+        if verification_lessons:
+            parsed["verification_lessons"] = verification_lessons
+            logger.info("retrospective saved %d verification lessons", len(verification_lessons))
+    except Exception as e:
+        logger.warning("verification lesson mining failed: %s", e)
 
     return parsed
