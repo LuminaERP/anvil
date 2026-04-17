@@ -50,6 +50,7 @@ class AnvilRunner:
         timeout_sec: int = 600,
         python_exe: str = sys.executable,
         extra_env: dict[str, str] | None = None,
+        shared_memory: bool = True,
     ) -> None:
         self.anvil_root = anvil_root.resolve()
         self.sandbox_root = sandbox_root.resolve()
@@ -58,6 +59,16 @@ class AnvilRunner:
         self.python_exe = python_exe
         self.extra_env = extra_env or {}
         self.sandbox_root.mkdir(parents=True, exist_ok=True)
+
+        # Shared memory pool: cross-task lesson propagation within a batch.
+        # Each task has its own AGENT_DATA (isolation), but all tasks in the
+        # batch share AGENT_SHARED_DATA so lessons from completed tasks show
+        # up on siblings' next reflection cycle.
+        if shared_memory:
+            self.shared_dir = self.sandbox_root / "_shared_memory"
+            self.shared_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self.shared_dir = None
 
     def task_workspace(self, task_id: str) -> Path:
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in task_id)
@@ -78,6 +89,8 @@ class AnvilRunner:
         env["AGENT_DATA"] = str(data_dir)
         env["AGENT_YOLO"] = "1"
         env["PYTHONPATH"] = f"{self.anvil_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+        if self.shared_dir is not None:
+            env["AGENT_SHARED_DATA"] = str(self.shared_dir)
         env.update(self.extra_env)
 
         # autonomous.main is one-shot — runs one graph traversal. The max_cycles

@@ -127,7 +127,12 @@ def find_examples(source: str, entry_point: str | None = None) -> list[Example]:
 
 
 def _parse_doctest_style(docstring: str, entry_point: str, base_line: int) -> list[Example]:
-    """Find classic doctest `>>> expr\\n<expected>` pairs."""
+    """Find classic doctest `>>> expr\\n<expected>` pairs.
+
+    Special handling for the HumanEval idiom `>>> f(x) == y` with no output
+    line — this is an assertion, not a value expression. We split on `==`
+    and treat it as (source=`f(x)`, expected=`y`).
+    """
     import doctest
     parser = doctest.DocTestParser()
     try:
@@ -142,6 +147,21 @@ def _parse_doctest_style(docstring: str, entry_point: str, base_line: int) -> li
         expected = ex.want.rstrip()
         if not source:
             continue
+
+        # Detect the assertion idiom: `f(x) == value` with no following output
+        if not expected and _looks_like_top_level_eq(source, entry_point):
+            split = _split_toplevel_eq(source)
+            if split is not None:
+                call, expected_val = split
+                out.append(Example(
+                    source=call,
+                    expected=expected_val,
+                    line=base_line + (ex.lineno or 0),
+                    kind=">>>",
+                    entry_point=entry_point,
+                ))
+                continue
+
         out.append(Example(
             source=source,
             expected=expected,
@@ -150,6 +170,35 @@ def _parse_doctest_style(docstring: str, entry_point: str, base_line: int) -> li
             entry_point=entry_point,
         ))
     return out
+
+
+def _looks_like_top_level_eq(source: str, entry_point: str) -> bool:
+    """Heuristic: source starts with a call to entry_point and contains ` == `."""
+    stripped = source.strip()
+    return stripped.startswith(entry_point) and " == " in stripped
+
+
+def _split_toplevel_eq(source: str) -> tuple[str, str] | None:
+    """Parse `f(x, y) == value` and return ('f(x, y)', 'value').
+
+    Uses AST-aware splitting so nested `==` inside args don't confuse us.
+    """
+    try:
+        tree = ast.parse(source.strip(), mode="eval")
+    except SyntaxError:
+        return None
+    if not isinstance(tree.body, ast.Compare):
+        return None
+    if len(tree.body.ops) != 1 or not isinstance(tree.body.ops[0], ast.Eq):
+        return None
+    try:
+        left = ast.unparse(tree.body.left).strip()
+        right = ast.unparse(tree.body.comparators[0]).strip()
+    except Exception:
+        return None
+    if not left or not right:
+        return None
+    return left, right
 
 
 def _parse_assertion_style(docstring: str, entry_point: str, base_line: int) -> list[Example]:

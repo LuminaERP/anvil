@@ -8,10 +8,18 @@ Data model:
   lessons(id INTEGER PRIMARY KEY, session_id, text, severity, tags JSON, ts)
   lesson_vec(lesson_id INTEGER PRIMARY KEY, embedding BLOB)   <- vec0 virtual table
 
-Semantic recall: embed a query, KNN against lesson_vec, return top-K lessons.
+Memory is layered:
+  - Local: per-session SQLite file (AGENT_DATA) — full episode history + lessons
+  - Shared: cross-session pool (AGENT_SHARED_DATA) — deduplicated transferable
+    lessons from retrospectives, queried alongside local at recall time
+
+When a new lesson is added via `add_lesson()`, it lands locally. To propagate
+to siblings in a batch, call `publish_lesson()` — retrospectives do this
+automatically for lessons of medium+ confidence.
 """
 from __future__ import annotations
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -25,6 +33,9 @@ from sentence_transformers import SentenceTransformer
 
 from ..config import CONFIG
 from ..state import HistoryEvent, Lesson
+from .shared import SharedMemoryPool, get_default_pool
+
+logger = logging.getLogger(__name__)
 
 
 _EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
@@ -72,10 +83,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS lesson_vec USING vec0(
 class Memory:
     _embedder: Optional[SentenceTransformer] = None
 
-    def __init__(self, db_path: Optional[Path] = None) -> None:
-        self.db_path = db_path or CONFIG["paths"].memory_db
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        shared_pool: Optional[SharedMemoryPool] = None,
+        use_shared_pool: bool = True,
+    ) -> None:
+        self.db_path = Path(db_path) if db_path else CONFIG["paths"].memory_db
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+
+        # Auto-detect shared pool unless caller explicitly opts out
+        if shared_pool is not None:
+            self.shared = shared_pool
+        elif use_shared_pool:
+            self.shared = get_default_pool()
+        else:
+            self.shared = None
+
+        if self.shared:
+            logger.debug("Memory: shared pool enabled at %s", self.shared.db_path)
 
     def _init_db(self) -> None:
         conn = self._connect()
@@ -139,6 +166,8 @@ class Memory:
             )
 
     def add_lesson(self, session_id: str, lesson: Lesson) -> int:
+        """Store a lesson in local memory only. Use `publish_lesson()` to also
+        broadcast to the shared pool for sibling sessions."""
         with self._cursor() as cur:
             cur.execute(
                 "INSERT INTO lessons(session_id, text, severity, tags, ts) VALUES (?,?,?,?,?)",
@@ -151,10 +180,83 @@ class Memory:
             )
             return lesson_id
 
+    def publish_lesson(
+        self,
+        session_id: str,
+        lesson: Lesson,
+        confidence: str = "medium",
+        task_id: Optional[str] = None,
+    ) -> tuple[int, Optional[int]]:
+        """Store a lesson locally AND publish to the shared pool.
+
+        The shared pool dedupes via semantic similarity — if a sibling session
+        has already contributed an equivalent lesson, ref_count is bumped on
+        the existing record rather than creating a new one.
+
+        Returns (local_id, shared_id). shared_id is None if no pool is active.
+        """
+        local_id = self.add_lesson(session_id, lesson)
+        shared_id = None
+        if self.shared is not None:
+            try:
+                shared_id = self.shared.publish(
+                    text=lesson.text,
+                    session_id=session_id,
+                    severity=lesson.severity,
+                    confidence=confidence,
+                    tags=lesson.tags,
+                    task_id=task_id,
+                )
+            except Exception as e:
+                logger.warning("publish to shared pool failed: %s", e)
+        return local_id, shared_id
+
     # ---- reads -------------------------------------------------------------
 
-    def recall_lessons(self, query: str, k: int = 5) -> list[dict]:
-        """Semantic KNN over prior lessons. Returns dicts with text+severity+distance."""
+    def recall_lessons(self, query: str, k: int = 5, include_shared: bool = True) -> list[dict]:
+        """Semantic KNN over prior lessons. Returns dicts with text+severity+distance.
+
+        When a shared pool is active and `include_shared=True`, results are
+        merged from BOTH local memory and shared memory, deduplicated by text
+        and sorted by distance.
+        """
+        local = self._recall_local(query, k=k)
+        if not include_shared or self.shared is None:
+            return local
+
+        try:
+            shared = self.shared.query(query, k=k, min_confidence="low")
+        except Exception as e:
+            logger.warning("shared pool query failed, returning local only: %s", e)
+            return local
+
+        # Merge: dedup by text, keep the lower distance on ties
+        by_text: dict[str, dict] = {}
+        for row in local:
+            by_text[row["text"]] = {**row, "source": "local"}
+        for sh in shared:
+            key = sh.text
+            incoming = {
+                "id": f"shared:{sh.id}",
+                "text": sh.text,
+                "severity": sh.severity,
+                "tags": sh.tags,
+                "distance": sh.distance if sh.distance is not None else 1.0,
+                "source": "shared",
+                "confidence": sh.confidence,
+                "ref_count": sh.ref_count,
+            }
+            if key in by_text:
+                # Keep the record with lower distance (= closer match)
+                if incoming["distance"] < by_text[key]["distance"]:
+                    by_text[key] = incoming
+            else:
+                by_text[key] = incoming
+
+        merged = sorted(by_text.values(), key=lambda r: r.get("distance") or 1.0)[:k]
+        return merged
+
+    def _recall_local(self, query: str, k: int = 5) -> list[dict]:
         qvec = self._embed(query)
         with self._cursor() as cur:
             rows = cur.execute(

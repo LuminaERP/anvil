@@ -237,17 +237,27 @@ def run_retrospective(session_id: str, goal: str, final_status: str) -> dict:
     except Exception as e:
         parsed = {"error": str(e), "raw": raw[:400]}
 
-    # Persist the optimization lesson
+    # Persist the optimization lesson — publish to shared pool so siblings see it
     opt = parsed.get("optimization_lesson", "").strip() if isinstance(parsed, dict) else ""
     if opt:
         try:
-            mem.add_lesson(session_id, Lesson(
-                text=opt,
-                severity="info",
-                tags=["retrospective", "optimization"],
-            ))
-        except Exception:
-            pass
+            if hasattr(mem, "publish_lesson"):
+                mem.publish_lesson(
+                    session_id=session_id,
+                    lesson=Lesson(
+                        text=opt,
+                        severity="info",
+                        tags=["retrospective", "optimization"],
+                    ),
+                    confidence="medium",  # retrospective optimisations are medium-confidence
+                )
+            else:
+                mem.add_lesson(session_id, Lesson(
+                    text=opt, severity="info",
+                    tags=["retrospective", "optimization"],
+                ))
+        except Exception as e:
+            logger.debug("failed to persist optimization_lesson: %s", e)
 
     # Maybe save the compressed skill
     sk = parsed.get("save_skill") if isinstance(parsed, dict) else None

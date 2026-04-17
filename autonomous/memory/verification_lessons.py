@@ -236,23 +236,40 @@ def _strip_json_fence(text: str) -> str:
 
 
 def _try_save(memory, indexable_text: str, snippet_text: str, lesson: Lesson, failure: VerificationFailure) -> None:
-    """Adapt to whatever `save_lesson`/`save_memory` signature the Memory class exposes."""
-    # Pattern 1: Memory.save_lesson(text, severity, context, ...)
-    if hasattr(memory, "save_lesson"):
-        try:
-            memory.save_lesson(
-                text=indexable_text,
-                severity={"high": "high", "medium": "medium", "low": "low"}.get(lesson.confidence, "medium"),
-                context=snippet_text,
-                tags=lesson.trigger_keywords,
-            )
-            return
-        except TypeError:
-            # Fallback to minimal signature
-            memory.save_lesson(text=indexable_text, severity=lesson.confidence)
-            return
-    # Pattern 2: Memory.add(text, ...)
-    if hasattr(memory, "add"):
-        memory.add(text=indexable_text, metadata={"source": "verification_failure", "lesson_pattern": lesson.pattern})
+    """Publish the lesson via the memory layer's publish_lesson API.
+
+    publish_lesson writes to local memory AND broadcasts to the shared pool
+    (if one is configured). Siblings running in parallel pick up the lesson
+    on their next reflection cycle.
+    """
+    from ..state import Lesson as LessonState
+
+    lesson_record = LessonState(
+        text=indexable_text,
+        severity={"low": "info", "medium": "warn", "high": "error"}.get(lesson.confidence, "warn"),
+        tags=list(lesson.trigger_keywords) + ["verification_failure"],
+    )
+
+    # Prefer the new publish_lesson API (writes local + shared)
+    if hasattr(memory, "publish_lesson"):
+        memory.publish_lesson(
+            session_id=failure.entry_point,  # best-effort — caller may not know session_id
+            lesson=lesson_record,
+            confidence=lesson.confidence,
+            task_id=failure.entry_point,
+        )
         return
-    raise RuntimeError("Memory object has neither save_lesson() nor add()")
+
+    # Legacy path
+    if hasattr(memory, "add_lesson"):
+        memory.add_lesson(failure.entry_point, lesson_record)
+        return
+    if hasattr(memory, "save_lesson"):
+        memory.save_lesson(
+            text=indexable_text,
+            severity=lesson_record.severity,
+            context=snippet_text,
+            tags=lesson.trigger_keywords,
+        )
+        return
+    raise RuntimeError("Memory object has no publish_lesson / add_lesson / save_lesson method")

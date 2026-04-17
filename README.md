@@ -1,9 +1,19 @@
-# Anvil
+<p align="center">
+  <img src="assets/anvil-logo.png" alt="Anvil — Autonomous Coding System" width="480">
+</p>
 
-> Autonomous multi-agent coding system with neural safety, semantic memory, and local fleet inference.
+<p align="center">
+  <em>Autonomous multi-agent coding system with neural safety, semantic memory, and local fleet inference.</em>
+</p>
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+<p align="center">
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="#benchmarks"><img src="https://img.shields.io/badge/HumanEval-87.2%25-brightgreen.svg" alt="HumanEval 87.2%"></a>
+</p>
+
+---
+
 
 Anvil is a long-running autonomous agent that plans, implements, reviews, and learns. It reads before it writes, grounds every claim in tool output, and refuses to ship code that fails static analysis or regresses existing tests. It runs against a local vLLM fleet, so a single overnight session can chew through fifty-plus backlog items for the cost of the electricity to keep the GPU warm.
 
