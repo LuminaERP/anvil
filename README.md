@@ -136,6 +136,7 @@ See `CHANGELOG.md` for release-by-release improvements.
 
 ---
 
-## Licence
+## License
 
-MIT. See [LICENSE](LICENSE).
+Anvil is licensed under the **Business Source License 1.1** (BSL 1.1).  
+See the [LICENSE](LICENSE) file for the full license text.
