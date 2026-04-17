@@ -8,7 +8,8 @@
 
 <p align="center">
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://github.com/LuminaERP/anvil/blob/main/LICENSE">
+  <img src="https://img.shields.io/badge/License-Business_Source_1.1-red.svg" alt="License: Business Source 1.1"> </a>
   <a href="#benchmarks"><img src="https://img.shields.io/badge/HumanEval-87.2%25-brightgreen.svg" alt="HumanEval 87.2%"></a>
 </p>
 
