@@ -1,0 +1,241 @@
+"""
+Executor node — ReAct loop with native OpenAI-style tool calling.
+
+Processes ONE subgoal from state.subgoals (the next pending one whose deps are met).
+Runs a bounded inner loop: model decides tool calls → we execute them → feed
+observations back → repeat until the model emits a final answer OR we hit the cap.
+
+Terminal events:
+  subgoal.status = "done"   -> subgoal.result is the final answer
+  subgoal.status = "failed" -> error captured in subgoal.result
+"""
+from __future__ import annotations
+import datetime
+import json
+import time
+import traceback
+from typing import Any
+
+from openai import OpenAI, BadRequestError
+
+from ..config import CONFIG
+from ..state import AgentState, Subgoal, HistoryEvent, ToolCall
+from ..tools import REGISTRY, ToolError
+
+
+_SYSTEM_PROMPT = """You are the Executor, a ReAct coding agent with tools. Call tools via the tool_calls API (NOT as text with <tool_call> tags).
+
+You will be given:
+  - ORIGINAL GOAL
+  - SUBGOAL (what you must complete NOW)
+  - DEPENDENCY OUTPUTS from prior subgoals
+  - MEMORY: relevant lessons from prior sessions (may include pre-seeded library docs)
+
+MANDATORY DISCIPLINE — violations cause the reviewer to REJECT your work:
+
+1. **READ BEFORE WRITING.** If you will write tests for module X or edit module X:
+   a. FIRST call read_file on module X (or grep for `^def ` in X) to confirm what functions ACTUALLY exist and their signatures.
+   b. Use the REAL function names from the file, not what you think they should be called.
+   c. If the module name is `stitchforge_pipeline.py`, import as `stitchforge_pipeline`, not `pipeline`.
+
+2. **GROUND UNFAMILIAR APIs IN REAL SOURCES.** Before writing code that uses a library you're unsure of:
+   a. For **API reference / syntax**: call context7_resolve → context7_docs with a narrow topic.
+   b. For **concrete code examples**: call nia_package_search with the registry (pypi/npm/etc.), package name, and 1-3 semantic queries. This returns REAL SOURCE CODE from the actual package — trust it over your training intuition.
+   c. If both fail, note the uncertainty in your final answer rather than guessing.
+
+3. **PREFER edit_file OVER apply_patch.** Unified diffs are hard to get right; the patch format gets rejected if a single whitespace is wrong. Use edit_file(path, start_line, end_line, new_content) for targeted changes — it's far more reliable.
+
+4. **VERIFY AFTER WRITING.** After write_file or edit_file:
+   a. If you wrote a .py file, call run_bash with `python -c "import ast; ast.parse(open('PATH').read())"` to prove it parses.
+   b. If you wrote a test file, call run_pytest on it and report pass/fail in your final answer.
+   c. If you wrote a report, read_file the first 30 lines back to confirm it contains what you intended.
+
+5. **CITE FROM OBSERVATIONS, NEVER INVENT.**
+   - URLs in reports MUST be URLs that appeared in an actual web_fetch / web_search / context7 observation.
+   - Line numbers in bug reports MUST come from a read_file that shows that line.
+   - Function names MUST come from a read_file or grep observation.
+   - Code patterns from nia_package_search are GROUND TRUTH; prefer them to your own intuition.
+
+6. **NO TOOL-CALL TEXT.** Never write `<tool_call>` or `<function=>` as content. Use the proper tool_calls API.
+
+7. **NO STUBS.** Tests with `pass`, `...`, or placeholder asserts (`assert True`, `assert result == True` where result is hardcoded True) are automatic failures.
+
+8. Emit a final text answer (no tool_calls) ONLY when steps 1-7 are satisfied."""
+
+
+def _now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _pick_next_subgoal(subgoals: list[Subgoal]) -> int | None:
+    """Return index of next runnable subgoal, or None if all done/blocked."""
+    done_ids = {s.id for s in subgoals if s.status == "done"}
+    for i, s in enumerate(subgoals):
+        if s.status != "pending":
+            continue
+        if all(d in done_ids for d in s.depends_on):
+            return i
+    return None
+
+
+def _dep_context(subgoal: Subgoal, subgoals: list[Subgoal]) -> str:
+    if not subgoal.depends_on:
+        return ""
+    lines = ["DEPENDENCY OUTPUTS:"]
+    for dep_id in subgoal.depends_on:
+        dep = next((s for s in subgoals if s.id == dep_id), None)
+        if dep and dep.result:
+            lines.append(f"\n[{dep_id}: {dep.description}]\n{dep.result[:4000]}")
+    return "\n".join(lines)
+
+
+def _format_user_turn(goal: str, subgoal: Subgoal, subgoals: list[Subgoal], memory_ctx: str) -> str:
+    parts = [
+        f"ORIGINAL GOAL:\n{goal}",
+        f"\nSUBGOAL ({subgoal.id}):\n{subgoal.description}",
+    ]
+    dep = _dep_context(subgoal, subgoals)
+    if dep:
+        parts.append("\n" + dep)
+    if memory_ctx:
+        parts.append(f"\nMEMORY:\n{memory_ctx}")
+    return "\n".join(parts)
+
+
+def _run_tool(name: str, args: dict) -> ToolCall:
+    start = time.time()
+    tc = ToolCall(name=name, args=args)
+    try:
+        tool = REGISTRY.get(name)
+        tc.result = tool.fn(**args)
+    except ToolError as e:
+        tc.error = str(e)
+    except TypeError as e:
+        tc.error = f"bad arguments: {e}"
+    except Exception as e:
+        tc.error = f"unexpected {type(e).__name__}: {e}"
+    tc.duration_ms = int((time.time() - start) * 1000)
+    return tc
+
+
+def executor_node(state: AgentState) -> dict:
+    subgoals: list[Subgoal] = state.get("subgoals") or []
+    idx = _pick_next_subgoal(subgoals)
+    if idx is None:
+        # Nothing runnable; let the router see all done (or blocked)
+        return {"status": "reflecting"}
+
+    sg = subgoals[idx]
+    sg.status = "running"
+    sg.attempts += 1
+    fleet = CONFIG["fleet"]
+    budget = CONFIG["budget"]
+
+    # Small/cheap subgoals go to worker; reasoning-heavy to executor.
+    ep = fleet.worker if sg.role == "worker" else fleet.executor
+    client = OpenAI(base_url=ep.base_url, api_key="EMPTY")
+
+    history_events: list[HistoryEvent] = [HistoryEvent(
+        kind="subgoal_start",
+        subgoal_id=sg.id,
+        content=f"[{sg.role}] {sg.description}",
+        timestamp=_now(),
+    )]
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user",   "content": _format_user_turn(
+            state["goal"], sg, subgoals, state.get("memory_context", ""))},
+    ]
+    tool_schemas = REGISTRY.schemas() if sg.role == "executor" else None
+    all_tool_calls: list[ToolCall] = []
+
+    final_text = ""
+    for turn in range(budget.executor_max_turns):
+        kwargs: dict[str, Any] = dict(
+            model=ep.name,
+            messages=messages,
+            max_tokens=ep.max_tokens,
+            temperature=ep.temperature,
+        )
+        if tool_schemas:
+            kwargs["tools"] = tool_schemas
+            kwargs["tool_choice"] = "auto"
+
+        try:
+            r = client.chat.completions.create(**kwargs)
+        except BadRequestError as e:
+            sg.status = "failed"
+            sg.result = f"LLM bad request: {e}"
+            break
+        except Exception as e:
+            sg.status = "failed"
+            sg.result = f"LLM call failed: {e}"
+            break
+
+        msg = r.choices[0].message
+        messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in (msg.tool_calls or [])
+            ] if msg.tool_calls else None,
+        })
+
+        # No tool calls => final answer
+        if not msg.tool_calls:
+            final_text = msg.content or "(no content)"
+            sg.status = "done"
+            sg.result = final_text
+            break
+
+        # Execute each tool call, append tool responses
+        if len(msg.tool_calls) > budget.max_tool_calls_per_step:
+            # Truncate: model is fanning out too hard
+            msg.tool_calls = msg.tool_calls[: budget.max_tool_calls_per_step]
+
+        for tc in msg.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError as e:
+                obs = f"ERROR: invalid JSON arguments: {e}"
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": obs})
+                continue
+            run = _run_tool(tc.function.name, args)
+            all_tool_calls.append(run)
+            obs = run.result if run.error is None else f"ERROR: {run.error}"
+            # Truncate massive observations to protect context
+            if len(obs or "") > 20_000:
+                obs = obs[:20_000] + "\n... (observation truncated)"
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": obs or ""})
+
+            history_events.append(HistoryEvent(
+                kind="tool_call",
+                subgoal_id=sg.id,
+                content=f"{run.name}({', '.join(f'{k}={str(v)[:60]}' for k, v in args.items())}) -> {'err' if run.error else 'ok'}",
+                data={"tool": run.name, "args": args, "error": run.error, "duration_ms": run.duration_ms},
+                timestamp=_now(),
+            ))
+    else:
+        # Hit turn cap without terminating
+        sg.status = "failed"
+        sg.result = f"executor exhausted {budget.executor_max_turns} turns without a final answer"
+
+    history_events.append(HistoryEvent(
+        kind="subgoal_end",
+        subgoal_id=sg.id,
+        content=f"[{sg.status}] {sg.result[:200] if sg.result else ''}",
+        data={"status": sg.status, "attempts": sg.attempts, "tool_calls": len(all_tool_calls)},
+        timestamp=_now(),
+    ))
+
+    # Replace subgoals list (mutated in place; also return to state explicitly for safety)
+    return {
+        "subgoals": subgoals,
+        "last_tool_calls": all_tool_calls,
+        "last_observation": sg.result or "",
+        "status": "reflecting" if _pick_next_subgoal(subgoals) is None else "executing",
+        "history": history_events,
+    }

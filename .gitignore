@@ -1,0 +1,77 @@
+# Model weights — downloaded on demand, too large for git
+models/
+*.safetensors
+*.bin
+*.gguf
+
+# Runtime state
+logs/
+*.log
+
+# SQLite runtime state (memory, skills, checkpoints, audit) — local to each deployment
+autonomous/data/
+autonomous/memory/*.sqlite
+autonomous/memory/*.sqlite-shm
+autonomous/memory/*.sqlite-wal
+
+# Agent output from test runs (keep seed corpus, exclude generated reports)
+test_output/
+test_input/__pycache__/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Archives / backups
+*.tgz
+*.tar
+*.tar.gz
+*.zip
+
+# Experiment artefacts
+temp/
+experimental/
+scratch/
+*.ORIGINAL.py
+*.bak
+
+# Old iteration tests that are no longer part of the core
+test_step*.py
+comprehensive_*.py
+test_parse_and_validate*.py
+refactored_test_generator.py
+vllm_server_test_generator.py
+test_e2e_pskit.py
+test_pskit_bridge.py
+test_planner_json.py
+test_safety_gates.py
+
+# Transient agent staging dirs
+v*_except_fixes*.patch
+ciede2000_*.md
+embroidery_*.md
+stitchforge_*.py
+stitchforge_*.md
+pipeline_v*.py
+
+# OS + editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Nia/Context7/etc cached state
+.nia/
+.context7/
