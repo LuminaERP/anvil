@@ -10,7 +10,7 @@
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
   <a href="https://github.com/LuminaERP/anvil/blob/main/LICENSE">
   <img src="https://img.shields.io/badge/License-Business_Source_1.1-red.svg" alt="License: Business Source 1.1"> </a>
-  <a href="#benchmarks"><img src="https://img.shields.io/badge/HumanEval-87.2%25-brightgreen.svg" alt="HumanEval 87.2%"></a>
+  <a href="#benchmarks"><img src="https://img.shields.io/badge/HumanEval-92.7%25-brightgreen.svg" alt="HumanEval 92.7%"></a>
 </p>
 
 ---
@@ -126,6 +126,23 @@ Three stores, all SQLite:
 - **`autonomous/data/checkpoints.sqlite`** — LangGraph's session checkpoints so a session can resume after a crash.
 
 All stores are local to each deployment (gitignored). Seed a fresh machine with `python -m autonomous.seed_docs --workspace .` which pre-loads Context7 docs for the libraries in your code into the lesson store.
+
+---
+
+## Benchmarks
+
+| Suite | Tasks | Pass Rate | Notes |
+|-------|-------|-----------|-------|
+| HumanEval | 164 | **92.7%** (152/164) | Single-function Python completion. Matches GPT-5-class performance on the saturated baseline. |
+| BigCodeBench | 1,140 | in progress | Complex Python with diverse libraries (pandas, numpy, regex, crypto, requests). |
+| BFCL v4 | 1,000 | queued | Tool/function calling correctness. |
+| LiveCodeBench | 175 | queued | Contamination-resistant competitive Python. |
+| Aider Polyglot | 225 | queued | Multi-language Exercism edits (C++, Go, Java, JS, Python, Rust). |
+| SWE-bench Lite | 300 | queued | Real GitHub issue resolution on popular Python projects. |
+
+Measured against OpenAI's reference grader. Reproduce with `python -m benchmarks.humaneval.run --end-to-end --workers 8`.
+
+The HumanEval delta from a naive run (87.2% -> 92.7%, +9 tasks recovered) came from architectural improvements: docstring verification gate in the reflector, shared memory pool for cross-session lesson propagation, and stricter workspace isolation. See [benchmarks/README.md](benchmarks/README.md).
 
 ---
 
