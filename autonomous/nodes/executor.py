@@ -12,6 +12,7 @@ Terminal events:
 from __future__ import annotations
 import datetime
 import json
+import os
 import time
 import traceback
 from typing import Any
@@ -212,8 +213,18 @@ def executor_node(state: AgentState) -> dict:
     tool_schemas = REGISTRY.schemas() if sg.role == "executor" else None
     all_tool_calls: list[ToolCall] = []
 
+    # Difficulty-aware turn cap: adapter/planner/env can attach `difficulty`.
+    # Easy tasks finish fast; hard ones get room to iterate.
+    from ..config import resolve_turn_cap
+    difficulty = (
+        getattr(sg, "difficulty", None)
+        or (state.get("task_difficulty") if isinstance(state, dict) else None)
+        or os.environ.get("AGENT_TASK_DIFFICULTY")
+    )
+    max_turns = resolve_turn_cap(difficulty, default=budget.executor_max_turns)
+
     final_text = ""
-    for turn in range(budget.executor_max_turns):
+    for turn in range(max_turns):
         kwargs: dict[str, Any] = dict(
             model=ep.name,
             messages=messages,
@@ -229,11 +240,37 @@ def executor_node(state: AgentState) -> dict:
         except BadRequestError as e:
             sg.status = "failed"
             sg.result = f"LLM bad request: {e}"
+            # Record for error taxonomy
+            try:
+                from ..metrics import METRICS
+                METRICS.record_error(state.get("session_id", ""), str(e))
+            except Exception:
+                pass
             break
         except Exception as e:
             sg.status = "failed"
             sg.result = f"LLM call failed: {e}"
+            try:
+                from ..metrics import METRICS
+                METRICS.record_error(state.get("session_id", ""), str(e))
+            except Exception:
+                pass
             break
+
+        # Token + cost accounting
+        try:
+            from ..metrics import METRICS, extract_usage
+            p_tok, c_tok = extract_usage(r)
+            if p_tok or c_tok:
+                METRICS.record_llm_call(
+                    session_id=state.get("session_id", ""),
+                    model=ep.name,
+                    prompt_tokens=p_tok,
+                    completion_tokens=c_tok,
+                    node="executor" if sg.role == "executor" else "worker",
+                )
+        except Exception:
+            pass
 
         msg = r.choices[0].message
         messages.append({

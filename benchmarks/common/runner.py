@@ -97,6 +97,12 @@ class AnvilRunner:
         # concept lives in the daemon; for benchmarks we cap work via timeout
         # and per-subgoal turn limits (configured in env before main runs).
         env["EXECUTOR_MAX_TURNS"] = str(max(6, self.max_cycles * 3))
+
+        # Propagate difficulty tag so the executor can pick the right turn cap
+        difficulty = (task.metadata or {}).get("difficulty")
+        if difficulty:
+            env["AGENT_TASK_DIFFICULTY"] = str(difficulty).lower()
+
         cmd = [
             self.python_exe, "-m", "autonomous.main",
             "--yolo",

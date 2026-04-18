@@ -62,8 +62,30 @@ class Budget:
     max_iterations: int = 25            # total plan/act/reflect cycles
     max_tool_calls_per_step: int = 8    # per-executor-turn tool-call cap
     max_parallel_workers: int = 4       # concurrency on worker pool
-    executor_max_turns: int = 18        # inner ReAct loop cap per subgoal
+    executor_max_turns: int = 18        # inner ReAct loop cap (default if no difficulty tag)
     max_context_chars: int = 40_000     # truncate long tool outputs
+
+    # Difficulty-aware turn caps: easy tasks finish fast, hard ones get room
+    # to iterate. Consumers call resolve_turn_cap(difficulty) rather than
+    # reading executor_max_turns directly.
+    turn_caps_by_difficulty: dict = field(default_factory=lambda: {
+        "trivial": 6,
+        "easy":    10,
+        "medium":  18,
+        "hard":    28,
+        "extreme": 40,
+    })
+
+
+def resolve_turn_cap(difficulty: str | None, default: int = 18) -> int:
+    """Look up the turn cap for a difficulty tag; fall back to default."""
+    caps = {
+        "trivial": 6, "easy": 10, "medium": 18, "hard": 28, "extreme": 40,
+    }
+    if difficulty is None:
+        return default
+    key = str(difficulty).strip().lower()
+    return caps.get(key, default)
 
 
 @dataclass(frozen=True)

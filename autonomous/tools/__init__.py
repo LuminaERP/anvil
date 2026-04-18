@@ -12,6 +12,7 @@ from . import context7    # noqa: F401
 from . import nia         # noqa: F401
 from . import verify      # noqa: F401
 from . import symbols       # noqa: F401
+from . import public_tests # noqa: F401
 from .base import REGISTRY, Tool, ToolError, register  # noqa: F401
 
 _log = logging.getLogger(__name__)

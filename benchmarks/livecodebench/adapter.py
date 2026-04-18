@@ -106,23 +106,57 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 public_tests_parsed = []
             examples = _format_public_tests(public_tests_parsed)
 
-            goal = (
-                f"Solve this competitive-programming problem in Python. Write the full "
-                f"solution to ./solution.py — class `Solution` with the method signature "
-                f"from the starter code. Do not add a __main__ block or tests. Your "
-                f"solution will be graded against hidden test cases.\n\n"
-                f"PROBLEM:\n{content}\n\n"
-                + (f"STARTER CODE:\n```python\n{starter}\n```\n\n" if starter else "")
-                + (f"PUBLIC EXAMPLES:\n{examples}\n" if examples else "")
+            # Infer task style from public tests. stdin → AtCoder/Codeforces style
+            # (read input, print output); functional → LeetCode class Solution style.
+            testtype = "stdin"
+            if public_tests_parsed:
+                testtype = public_tests_parsed[0].get("testtype", "stdin")
+
+            verify_nudge = (
+                "\n\nSELF-VERIFICATION (mandatory before declaring done):\n"
+                "After writing solution.py, call `run_public_tests(solution_path='solution.py')` "
+                "to verify against the public test cases (already saved to ./public_tests.json by "
+                "the harness). If any public test fails, fix the solution and re-verify. Only "
+                "declare done when ALL public tests pass."
             )
+
+            if testtype == "functional":
+                goal = (
+                    f"Solve this LeetCode-style problem in Python. Write the full "
+                    f"solution to ./solution.py — define `class Solution` with the method "
+                    f"signature from the starter code. Do not add a __main__ block, stdin "
+                    f"reading, print statements, or any code outside the class. Your "
+                    f"solution will be graded by instantiating Solution() and calling the method.\n\n"
+                    f"PROBLEM:\n{content}\n\n"
+                    + (f"STARTER CODE:\n```python\n{starter}\n```\n\n" if starter else "")
+                    + (f"PUBLIC EXAMPLES:\n{examples}\n" if examples else "")
+                    + verify_nudge
+                )
+            else:
+                goal = (
+                    f"Solve this competitive-programming problem in Python. Write the full "
+                    f"solution to ./solution.py as a TOP-LEVEL script that reads input from "
+                    f"stdin (via `input()` or `sys.stdin.read()`) and prints the answer(s) to "
+                    f"stdout. Do NOT define a class or a function you forget to call — the "
+                    f"grader runs the script and compares printed output to the expected "
+                    f"output. Do not add extra prints, debug output, or trailing characters.\n\n"
+                    f"PROBLEM:\n{content}\n\n"
+                    + (f"PUBLIC EXAMPLES (input → expected output):\n{examples}\n" if examples else "")
+                    + verify_nudge
+                )
+
+            # Seed the public tests so the agent can call run_public_tests
+            seed_files = {
+                "problem.md": content,
+                "public_tests.json": json.dumps(public_tests_parsed, indent=2),
+            }
+            if starter:
+                seed_files["starter.py"] = starter
 
             yield Task(
                 id=qid,
                 payload=row,
-                workspace_seed={
-                    "problem.md": content,
-                    **({"starter.py": starter} if starter else {}),
-                },
+                workspace_seed=seed_files,
                 goal=goal,
                 metadata={
                     "platform": row.get("platform"),
