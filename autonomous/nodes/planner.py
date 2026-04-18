@@ -133,7 +133,26 @@ def _format_memory_context(lessons: list[dict], similar_skills: list[dict]) -> s
 
 
 def plan_node(state: AgentState) -> dict:
-    """Called at session start AND when reflector flags stuck==True."""
+    """Called at session start AND when reflector flags stuck==True.
+
+    Wrapped in an `invoke_agent anvil.planner` span so nested LLM calls +
+    memory lookups roll up under one trace row in Grafana / Tempo.
+    """
+    from .. import telemetry as _tel
+    goal = state["goal"]
+    session_id = state.get("session_id", "") or ""
+    cycle = state.get("iterations", 0) if isinstance(state, dict) else 0
+
+    with _tel.agent_span("anvil.planner", session_id=session_id, cycle=cycle, node="planner") as _span:
+        try:
+            _span.set_attribute("anvil.goal", (goal or "")[:300])
+        except Exception:
+            pass
+        return _plan_node_inner(state)
+
+
+def _plan_node_inner(state: AgentState) -> dict:
+    """Actual planner body — extracted so the telemetry wrapper can stay thin."""
     goal = state["goal"]
     fleet = CONFIG["fleet"]
     client = OpenAI(base_url=fleet.planner.base_url, api_key="EMPTY")

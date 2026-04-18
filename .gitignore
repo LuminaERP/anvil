@@ -75,3 +75,4 @@ Thumbs.db
 # Nia/Context7/etc cached state
 .nia/
 .context7/
+.grafana_env

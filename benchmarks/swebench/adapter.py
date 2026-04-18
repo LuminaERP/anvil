@@ -115,25 +115,54 @@ class SWEBenchAdapter(BenchmarkAdapter):
 
     # ------- seed workspace -------
     def seed_workspace(self, task: Task, workspace: Path) -> None:
-        """Clone the repo at the correct commit into workspace/."""
+        """Clone the repo at the correct commit into workspace/.
+
+        The runner pre-creates the workspace dir for us, but `git clone` refuses
+        a non-empty target. We clone into a temp sibling, then move the .git +
+        files into place so the workspace path stays stable for downstream code.
+        """
+        import shutil
         workspace.mkdir(parents=True, exist_ok=True)
         repo = task.metadata["repo"]
         base = task.metadata["base_commit"]
 
-        # Use git clone + checkout; supports --reference caches later if desired
+        # Clone into a sibling temp dir
+        clone_target = workspace.parent / (workspace.name + ".__clone__")
+        if clone_target.exists():
+            shutil.rmtree(clone_target)
+
+        try:
+            subprocess.run(
+                ["git", "clone", "--quiet", f"https://github.com/{repo}.git", str(clone_target)],
+                check=True, capture_output=True, timeout=300,
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"git clone failed for {repo}: "
+                f"{(e.stderr or b'').decode('utf-8', errors='replace')[:300]}"
+            )
+
+        # Move clone contents (including .git) into the pre-created workspace
+        for item in clone_target.iterdir():
+            target = workspace / item.name
+            if target.exists():
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+            shutil.move(str(item), str(target))
+        shutil.rmtree(clone_target, ignore_errors=True)
+
+        # Check out the exact base commit
         subprocess.run(
-            ["git", "clone", f"https://github.com/{repo}.git", str(workspace)],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["git", "-C", str(workspace), "checkout", base],
-            check=True, capture_output=True,
+            ["git", "-C", str(workspace), "checkout", "--quiet", base],
+            check=True, capture_output=True, timeout=60,
         )
 
-        # Mark the commit so we can diff cleanly
+        # Tag it so we can diff cleanly later
         subprocess.run(
             ["git", "-C", str(workspace), "tag", "-f", "anvil-base", base],
-            check=False, capture_output=True,
+            check=False, capture_output=True, timeout=10,
         )
 
     # ------- extract -------

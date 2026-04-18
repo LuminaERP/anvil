@@ -130,47 +130,62 @@ def _run_tool(name: str, args: dict, session_id: str = "__default__") -> ToolCal
     start = time.time()
     tc = ToolCall(name=name, args=args)
 
-    # Repetition detector: if the same (tool, args) was just called, short-circuit
-    # with a warning so the agent sees "you already did this".
-    session_cache = _REPETITION_CACHE.setdefault(session_id, {})
-    h = _args_hash(name, args)
-    if h in session_cache:
-        tc.result = (
-            f"[REPEAT DETECTED] You just called {name} with identical arguments. "
-            f"The prior observation was:\n"
-            f"---\n{session_cache[h][:1500]}\n---\n"
-            f"Do not call the same tool+args again; use the result above or try a different approach."
-        )
-        tc.duration_ms = int((time.time() - start) * 1000)
-        return tc
+    # Wrap in execute_tool {name} span so Grafana / Tempo / Jaeger can show
+    # tool-level timing breakdowns. The span stays open for the full tool run.
+    from .. import telemetry as _tel
+    with _tel.tool_span(tool_name=name, args=args, session_id=session_id, subgoal_id=session_id) as tspan:
 
-    try:
-        tool = REGISTRY.get(name)
-        tc.result = tool.fn(**args)
-    except ToolError as e:
-        tc.error = str(e)
-    except TypeError as e:
-        tc.error = f"bad arguments: {e}"
-    except Exception as e:
-        tc.error = f"unexpected {type(e).__name__}: {e}"
-    tc.duration_ms = int((time.time() - start) * 1000)
+        # Repetition detector: if the same (tool, args) was just called, short-circuit
+        # with a warning so the agent sees "you already did this".
+        session_cache = _REPETITION_CACHE.setdefault(session_id, {})
+        h = _args_hash(name, args)
+        if h in session_cache:
+            tc.result = (
+                f"[REPEAT DETECTED] You just called {name} with identical arguments. "
+                f"The prior observation was:\n"
+                f"---\n{session_cache[h][:1500]}\n---\n"
+                f"Do not call the same tool+args again; use the result above or try a different approach."
+            )
+            tc.duration_ms = int((time.time() - start) * 1000)
+            _tel.record_tool_result(tspan, success=True, duration_ms=tc.duration_ms,
+                                    result_chars=len(tc.result or ""), error="repeat")
+            return tc
 
-    # Apply context-discipline truncation before this observation flows back
-    # into the executor's conversation. Short outputs pass through unchanged.
-    if tc.result:
         try:
-            from ..safety.output_truncation import truncate_observation
-            tr = truncate_observation(name, args, tc.result)
-            if tr.truncated:
-                tc.result = tr.text
-        except Exception:
-            pass  # never break a tool call over a truncation hiccup
+            tool = REGISTRY.get(name)
+            tc.result = tool.fn(**args)
+        except ToolError as e:
+            tc.error = str(e)
+        except TypeError as e:
+            tc.error = f"bad arguments: {e}"
+        except Exception as e:
+            tc.error = f"unexpected {type(e).__name__}: {e}"
+        tc.duration_ms = int((time.time() - start) * 1000)
 
-    # Record successful calls in the repetition cache so repeats can be detected
-    if tc.result and not tc.error:
-        session_cache[h] = tc.result
+        # Apply context-discipline truncation before this observation flows back
+        # into the executor's conversation. Short outputs pass through unchanged.
+        if tc.result:
+            try:
+                from ..safety.output_truncation import truncate_observation
+                tr = truncate_observation(name, args, tc.result)
+                if tr.truncated:
+                    tc.result = tr.text
+            except Exception:
+                pass
 
-    return tc
+        # Record successful calls in the repetition cache so repeats can be detected
+        if tc.result and not tc.error:
+            session_cache[h] = tc.result
+
+        # Finalize the tool span with outcome attributes
+        _tel.record_tool_result(
+            tspan,
+            success=(tc.error is None),
+            duration_ms=tc.duration_ms,
+            result_chars=len(tc.result or ""),
+            error=tc.error or "",
+        )
+        return tc
 
 
 def _reset_repetition_cache(session_id: str = "__default__") -> None:
@@ -186,6 +201,23 @@ def executor_node(state: AgentState) -> dict:
         return {"status": "reflecting"}
 
     sg = subgoals[idx]
+    session_id_for_span = state.get("session_id", "") or ""
+    # Open the invoke_agent span here so everything in this executor pass
+    # nests under it in Grafana / Tempo / Jaeger.
+    from .. import telemetry as _tel
+    agent_span_cm = _tel.agent_span(
+        agent_name="anvil.executor",
+        session_id=session_id_for_span,
+        cycle=state.get("iterations", 0) if isinstance(state, dict) else 0,
+        node="executor",
+    )
+    _ROOT_AGENT_SPAN = agent_span_cm.__enter__()
+    try:
+        _ROOT_AGENT_SPAN.set_attribute("anvil.subgoal_id", sg.id)
+        _ROOT_AGENT_SPAN.set_attribute("anvil.subgoal_description", (sg.description or "")[:300])
+    except Exception:
+        pass
+
     sg.status = "running"
     sg.attempts += 1
     fleet = CONFIG["fleet"]
@@ -413,6 +445,18 @@ def executor_node(state: AgentState) -> dict:
         data={"status": sg.status, "attempts": sg.attempts, "tool_calls": len(all_tool_calls)},
         timestamp=_now(),
     ))
+
+    # Close the invoke_agent span with final status
+    try:
+        _ROOT_AGENT_SPAN.set_attribute("anvil.subgoal_status", sg.status)
+        _ROOT_AGENT_SPAN.set_attribute("anvil.tool_calls_count", len(all_tool_calls))
+        _ROOT_AGENT_SPAN.set_attribute("anvil.final_turn", int(turn) if 'turn' in dir() else 0)
+    except Exception:
+        pass
+    try:
+        agent_span_cm.__exit__(None, None, None)
+    except Exception:
+        pass
 
     # Replace subgoals list (mutated in place; also return to state explicitly for safety)
     return {

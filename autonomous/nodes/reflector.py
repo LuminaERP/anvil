@@ -220,6 +220,18 @@ def _verify_written_code(state: AgentState) -> tuple[list[dict], list[HistoryEve
 
 
 def reflector_node(state: AgentState) -> dict:
+    from .. import telemetry as _tel
+    session_id = state.get("session_id", "") or ""
+    cycle = state.get("iterations", 0) if isinstance(state, dict) else 0
+    with _tel.agent_span("anvil.reflector", session_id=session_id, cycle=cycle, node="reflector") as _span:
+        try:
+            _span.set_attribute("anvil.subgoals_count", len(state.get("subgoals") or []))
+        except Exception:
+            pass
+        return _reflector_node_inner(state)
+
+
+def _reflector_node_inner(state: AgentState) -> dict:
     fleet = CONFIG["fleet"]
     client = OpenAI(base_url=fleet.reflector.base_url, api_key="EMPTY")
     subgoals = state.get("subgoals") or []

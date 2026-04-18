@@ -105,27 +105,50 @@ def init(
             "OTEL_SERVICE_INSTANCE_ID", socket.gethostname()
         )
 
-        resource = Resource.create({
-            "service.name": service_name,
-            "service.namespace": "lumina",
+        # Resource attrs: env vars override defaults. OTEL_RESOURCE_ATTRIBUTES
+        # (comma-separated k=v) is the OTel-standard way to inject extras and
+        # is merged in last so operators can override anything.
+        base_attrs = {
+            "service.name": os.environ.get("OTEL_SERVICE_NAME", service_name),
+            "service.namespace": os.environ.get("OTEL_SERVICE_NAMESPACE", "lumina"),
             "service.version": os.environ.get("ANVIL_VERSION", "0.1.0"),
             "service.instance.id": instance_id,
-            "deployment.environment": os.environ.get("ANVIL_ENV", "dev"),
-        })
+            "deployment.environment": os.environ.get(
+                "OTEL_DEPLOYMENT_ENVIRONMENT",
+                os.environ.get("ANVIL_ENV", "dev"),
+            ),
+        }
+        raw_extra = os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
+        if raw_extra:
+            for part in raw_extra.split(","):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    k = k.strip()
+                    v = v.strip()
+                    if k and v:
+                        base_attrs[k] = v
+
+        resource = Resource.create(base_attrs)
         _PROVIDER = TracerProvider(resource=resource)
 
         otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+        protocol = os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "").strip().lower()
         console_enabled = os.environ.get("ANVIL_TELEMETRY_CONSOLE", "").lower() in ("1", "true", "yes")
 
+        # Auto-detect protocol when not explicitly set. Grafana Cloud-style
+        # HTTPS endpoints default to http/protobuf; plain host:port defaults
+        # to gRPC. Users can override with OTEL_EXPORTER_OTLP_PROTOCOL.
+        if otlp_endpoint and not protocol:
+            if otlp_endpoint.startswith("https://") or "/otlp" in otlp_endpoint:
+                protocol = "http/protobuf"
+            else:
+                protocol = "grpc"
+
         if otlp_endpoint:
-            try:
-                from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-                exporter = OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)
+            exporter = _build_otlp_exporter(otlp_endpoint, protocol)
+            if exporter is not None:
                 _PROVIDER.add_span_processor(BatchSpanProcessor(exporter))
-                logger.info("telemetry → OTLP %s", otlp_endpoint)
-            except ImportError:
-                logger.warning("OTLP exporter missing; "
-                               "pip install opentelemetry-exporter-otlp-proto-grpc")
+                logger.info("telemetry → OTLP %s (%s)", otlp_endpoint, protocol)
 
         if console_enabled:
             _PROVIDER.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
@@ -158,6 +181,47 @@ def init(
                 logger.debug("auto-instrument failed: %s", e)
 
         return _TRACER
+
+
+def _build_otlp_exporter(endpoint: str, protocol: str) -> Any:
+    """Construct the right OTLP exporter for the given protocol.
+
+    Supports:
+      - 'http/protobuf' (Grafana Cloud, most hosted OTLP endpoints)
+      - 'grpc'          (self-hosted collectors, on-prem Tempo)
+
+    Returns None if the matching exporter package isn't installed.
+    """
+    if protocol in ("http/protobuf", "http", "http/json"):
+        try:
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+            # When endpoint= is passed explicitly, the HTTP exporter treats it
+            # as the FULL path (no auto-append of /v1/traces). Grafana Cloud's
+            # docs give you the base ".../otlp" and expect the client to add
+            # the signal path. Append it here if missing.
+            url = endpoint.rstrip("/")
+            if not url.endswith("/v1/traces"):
+                url = url + "/v1/traces"
+            return OTLPSpanExporter(endpoint=url)
+        except ImportError:
+            logger.warning(
+                "HTTP OTLP exporter requested but not installed. "
+                "pip install opentelemetry-exporter-otlp-proto-http"
+            )
+            return None
+
+    # Default: gRPC
+    try:
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        # insecure=True for plain host:port localhost setups; HTTPS uses TLS creds from env
+        use_insecure = endpoint.startswith("http://") or not endpoint.startswith("https://")
+        return OTLPSpanExporter(endpoint=endpoint, insecure=use_insecure)
+    except ImportError:
+        logger.warning(
+            "gRPC OTLP exporter requested but not installed. "
+            "pip install opentelemetry-exporter-otlp-proto-grpc"
+        )
+        return None
 
 
 def _flush_on_exit() -> None:
