@@ -224,7 +224,91 @@ def executor_node(state: AgentState) -> dict:
     max_turns = resolve_turn_cap(difficulty, default=budget.executor_max_turns)
 
     final_text = ""
+
+    # Lazy imports for budget + compaction so execution still works if the
+    # optional telemetry packages aren't installed.
+    try:
+        from ..budget import get_ledger, BudgetExceeded
+        from ..context_compaction import maybe_compact
+        from .. import telemetry as tel
+        session_id = state.get("session_id", "")
+        ledger = get_ledger(session_id) if session_id else None
+    except Exception:
+        ledger = None
+        maybe_compact = None  # type: ignore[assignment]
+        tel = None  # type: ignore[assignment]
+
+    # Determine the model's context limit so compaction has a number to aim at.
+    # vLLM publishes `max_model_len`; we conservatively use ep.max_context or 16k.
+    model_ctx_limit = int(getattr(ep, "max_context", 0) or 16_000)
+    # Cheap summarizer model: prefer the fleet's worker (smallest/cheapest).
+    try:
+        summarizer_model = fleet.worker.name
+        summarizer_client = OpenAI(base_url=fleet.worker.base_url, api_key="EMPTY")
+    except Exception:
+        summarizer_model = ep.name  # fallback to the executor itself
+        summarizer_client = client
+
     for turn in range(max_turns):
+        # Proactive compaction: check before each LLM call so we never blow
+        # the model's context window.
+        if maybe_compact is not None:
+            try:
+                messages, compaction_result = maybe_compact(
+                    messages=messages,
+                    model_ctx_limit=model_ctx_limit,
+                    openai_client=summarizer_client,
+                    summarizer_model=summarizer_model,
+                    session_id=state.get("session_id", ""),
+                    soft_ratio=0.70,
+                    keep_last_n_turns=3,
+                )
+                if compaction_result is not None:
+                    history_events.append(HistoryEvent(
+                        kind="compaction",
+                        subgoal_id=sg.id,
+                        content=(f"compacted {compaction_result.messages_before}→"
+                                 f"{compaction_result.messages_after} msgs, "
+                                 f"~{compaction_result.tokens_before}→"
+                                 f"{compaction_result.tokens_after} tokens"),
+                        timestamp=_now(),
+                    ))
+                    if ledger:
+                        ledger.reset_degrade_trigger()
+            except Exception:
+                pass  # compaction is best-effort; never break a turn over it
+
+        # Pre-call budget check
+        if ledger is not None:
+            try:
+                rendered_prompt = "\n".join((m.get("content") or "") for m in messages)
+                decision = ledger.check_pre_call(
+                    model=ep.name,
+                    prompt_text=rendered_prompt,
+                    max_output_tokens=ep.max_tokens,
+                )
+                if decision.action == "stop":
+                    sg.status = "failed"
+                    sg.result = f"[BUDGET EXCEEDED] {decision.reason}"
+                    history_events.append(HistoryEvent(
+                        kind="budget_exceeded",
+                        subgoal_id=sg.id,
+                        content=decision.reason,
+                        timestamp=_now(),
+                    ))
+                    break
+                # 'degrade' triggers already-done compaction on the next turn;
+                # we just log here.
+                if decision.action == "degrade":
+                    history_events.append(HistoryEvent(
+                        kind="budget_degrade",
+                        subgoal_id=sg.id,
+                        content=decision.reason,
+                        timestamp=_now(),
+                    ))
+            except Exception:
+                pass
+
         kwargs: dict[str, Any] = dict(
             model=ep.name,
             messages=messages,
