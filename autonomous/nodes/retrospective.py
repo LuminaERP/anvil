@@ -23,6 +23,7 @@ from openai import OpenAI
 from ..config import CONFIG
 from ..memory import Memory, SkillLibrary, Skill, SkillStep
 from ..memory.verification_lessons import VerificationFailure, save_lesson
+from ..memory.success_patterns import SuccessContext, save_pattern
 from ..state import Lesson
 
 logger = logging.getLogger(__name__)
@@ -284,4 +285,101 @@ def run_retrospective(session_id: str, goal: str, final_status: str) -> dict:
     except Exception as e:
         logger.warning("verification lesson mining failed: %s", e)
 
+    # Mine passing sessions for transferable algorithmic patterns
+    if final_status == "done":
+        try:
+            saved = _mine_success_patterns(events, mem, goal)
+            if saved:
+                parsed["success_patterns"] = saved
+                logger.info("retrospective saved %d success patterns", len(saved))
+        except Exception as e:
+            logger.warning("success pattern mining failed: %s", e)
+
     return parsed
+
+
+def _mine_success_patterns(events: list[dict], mem: Memory, goal: str) -> list[dict]:
+    """Collect code files the agent successfully wrote in this session and
+    extract algorithmic patterns via the supervisor LLM. Publish each to the
+    shared pool so siblings on similar problems can recall them.
+    """
+    from pathlib import Path
+    import ast as _ast
+
+    # Find .py files written this session. Same heuristic as reflector.
+    write_events = [
+        e for e in events
+        if e.get("kind") == "tool_call"
+        and "write_file" in (e.get("content") or "")
+        and ".py" in (e.get("content") or "")
+    ]
+    # Also check the verification events — a 'verification: N/N passed'
+    # indicates the file passed its contract.
+    verify_ok_paths: set[str] = set()
+    for e in events:
+        if e.get("kind") == "verification":
+            data = e.get("data") or {}
+            if data.get("total", 0) > 0 and data.get("passed", 0) == data.get("total", 0):
+                if data.get("path"):
+                    verify_ok_paths.add(str(data["path"]))
+
+    # Fall back to scanning workspace if no verification signals
+    workspace = Path(CONFIG["paths"].workspace)
+    candidate_files: list[Path] = []
+    if verify_ok_paths:
+        for p in verify_ok_paths:
+            fp = Path(p)
+            if fp.exists() and fp.suffix == ".py":
+                candidate_files.append(fp)
+    else:
+        # Pick up to 5 recent .py files in workspace / test_output
+        for pattern in ["solution.py", "*.py"]:
+            for fp in workspace.rglob(pattern):
+                if fp.is_file() and ".git" not in str(fp) and "__pycache__" not in str(fp):
+                    candidate_files.append(fp)
+                if len(candidate_files) >= 5:
+                    break
+            if candidate_files:
+                break
+
+    if not candidate_files:
+        return []
+
+    fleet = CONFIG["fleet"]
+    client = OpenAI(base_url=fleet.supervisor.base_url, api_key="EMPTY") if hasattr(fleet, "supervisor") else \
+             OpenAI(base_url=fleet.reflector.base_url, api_key="EMPTY")
+    model_name = getattr(fleet.supervisor, "name", None) if hasattr(fleet, "supervisor") else fleet.reflector.name
+
+    saved = []
+    for fp in candidate_files[:3]:  # cap to 3 per session so we don't explode LLM cost
+        try:
+            code = fp.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(code) < 60 or len(code) > 8000:
+            continue  # too trivial or too big
+        # Parseable?
+        try:
+            _ast.parse(code)
+        except SyntaxError:
+            continue
+
+        success = SuccessContext(
+            task_id=f"{fp.stem}",
+            problem_description=goal[:3000],
+            working_code=code,
+            domain_hint="coding/python",
+            test_outcome_summary=f"verified at {fp.name}" if str(fp) in verify_ok_paths else "",
+        )
+        try:
+            pat = save_pattern(success, mem, client, model=model_name)
+        except Exception as e:
+            logger.debug("pattern extract error for %s: %s", fp.name, e)
+            pat = None
+        if pat:
+            saved.append({
+                "name": pat.name,
+                "source_file": str(fp),
+                "confidence": pat.confidence,
+            })
+    return saved

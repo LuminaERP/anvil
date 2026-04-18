@@ -41,7 +41,7 @@ import sqlite_vec
 logger = logging.getLogger(__name__)
 
 
-_EMBED_DIM = 384  # bge-small-en-v1.5; must match episodic.Memory
+_EMBED_DIM = int(os.environ.get("AGENT_EMBEDDING_DIM", "384"))  # schema dim — stable across starts
 
 
 _SCHEMA = """
@@ -222,12 +222,9 @@ class SharedMemoryPool:
 
     @staticmethod
     def _embed(text: str) -> bytes:
-        """Use the same embedder as episodic.Memory so vectors are comparable."""
-        # Lazy import to avoid circular
-        from .episodic import Memory
-        import numpy as np
-        vec = Memory.embedder().encode(text, normalize_embeddings=True)
-        return np.asarray(vec, dtype=np.float32).tobytes()
+        """Unified embedder so local and shared memory share the same vector space."""
+        from . import embedder as _e
+        return _e.embed(text)
 
     # ---- public API: publish ----
 

@@ -29,17 +29,20 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 import sqlite_vec
-from sentence_transformers import SentenceTransformer
 
 from ..config import CONFIG
 from ..state import HistoryEvent, Lesson
+from . import embedder as _embedder_mod
 from .shared import SharedMemoryPool, get_default_pool
 
 logger = logging.getLogger(__name__)
 
 
-_EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
-_EMBED_DIM = 384
+# Schema dim — must be stable across process starts or existing vec0 tables
+# stop matching. Read from env (same variable the embedder uses), default 384
+# which matches the legacy BGE-small layout.
+import os as _os
+_EMBED_DIM = int(_os.environ.get("AGENT_EMBEDDING_DIM", "384"))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -81,8 +84,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS lesson_vec USING vec0(
 
 
 class Memory:
-    _embedder: Optional[SentenceTransformer] = None
-
     def __init__(
         self,
         db_path: Optional[Path] = None,
@@ -132,15 +133,20 @@ class Memory:
     # ---- embedding ---------------------------------------------------------
 
     @classmethod
-    def embedder(cls) -> SentenceTransformer:
-        if cls._embedder is None:
-            cls._embedder = SentenceTransformer(_EMBED_MODEL_NAME)
-        return cls._embedder
+    def embedder(cls):
+        """Back-compat shim. External callers (e.g. SharedMemoryPool._embed)
+        relied on Memory.embedder().encode(...). We now route through the
+        shared embedder module. Returns a lightweight wrapper exposing .encode
+        so existing code keeps working."""
+        class _Shim:
+            def encode(self_inner, text, normalize_embeddings=True):
+                import numpy as np
+                b = _embedder_mod.embed(text if isinstance(text, str) else str(text))
+                return np.frombuffer(b, dtype=np.float32)
+        return _Shim()
 
     def _embed(self, text: str) -> bytes:
-        import numpy as np
-        vec = self.embedder().encode(text, normalize_embeddings=True)
-        return np.asarray(vec, dtype=np.float32).tobytes()
+        return _embedder_mod.embed(text)
 
     # ---- writes ------------------------------------------------------------
 

@@ -93,15 +93,42 @@ def _parse_subgoals(text: str) -> list[dict]:
 
 
 def _format_memory_context(lessons: list[dict], similar_skills: list[dict]) -> str:
+    """Format recalled lessons/patterns/skills for the planner prompt.
+
+    Lessons split into two flavours:
+      - success patterns (text starts with '[PATTERN]') — transferable techniques
+        mined from solved tasks; planner should actively consider them
+      - regular lessons — failure-mode advice ("don't X", "always Y")
+    Rendered in separate sections so the planner treats them differently.
+    """
+    patterns = []
+    other_lessons = []
+    for l in lessons:
+        text = l.get("text", "")
+        if text.startswith("[PATTERN]"):
+            patterns.append(l)
+        else:
+            other_lessons.append(l)
+
     parts = []
-    if lessons:
-        parts.append("LESSONS FROM PRIOR SESSIONS:")
-        for l in lessons:
+    if patterns:
+        parts.append("PROVEN TECHNIQUES FROM SIMILAR SOLVED PROBLEMS (consider using):")
+        for p in patterns:
+            text = p.get("text", "")
+            src = p.get("source", "")
+            marker = "🧠" if src == "shared" else "📎"
+            parts.append(f"  {marker} {text[:400]}")
+
+    if other_lessons:
+        parts.append("\nLESSONS FROM PRIOR SESSIONS (avoid these mistakes):")
+        for l in other_lessons:
             parts.append(f"  - [{l['severity']}] {l['text']}")
+
     if similar_skills:
-        parts.append("\nRELEVANT SKILLS (prior successful sequences):")
+        parts.append("\nRELEVANT SKILLS (prior successful tool-call sequences):")
         for s in similar_skills:
             parts.append(f"  - {s['name']} (used {s['success_count']}x): {s['description']}")
+
     return "\n".join(parts) if parts else "(no prior experience with similar tasks)"
 
 
