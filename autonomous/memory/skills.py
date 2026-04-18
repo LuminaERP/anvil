@@ -111,7 +111,25 @@ class SkillLibrary:
         return sid
 
     def recall(self, query: str, k: int = 3) -> list[dict]:
+        """Recall top-k skills, re-ranked by relevance × rehearsal.
+
+        Previously sorted purely by vector distance (closest match first).
+        Now factors in success_count: a skill that has been used N times
+        successfully outranks a slightly-closer match with no history.
+        This auto-promotes proven skills as the library matures.
+
+        Score (lower is better):
+            score = distance / (1 + 0.35 * log(1 + success_count))
+
+        A skill used 10 times is preferred over a skill used once even if
+        the rarely-used skill has 20% lower vector distance. Prevents the
+        long-tail of one-off skills from drowning out reliable patterns.
+        """
+        import math
+
         qvec = self._embed(query)
+        # Pull extra candidates so re-ranking can actually reorder
+        fetch_k = max(k * 3, 8)
         with self._cursor() as cur:
             rows = cur.execute(
                 """
@@ -121,12 +139,21 @@ class SkillLibrary:
                 WHERE sv.embedding MATCH ? AND k = ?
                 ORDER BY sv.distance
                 """,
-                (qvec, k),
+                (qvec, fetch_k),
             ).fetchall()
+
+        scored = []
+        for r in rows:
+            dist = r[5] or 1.0
+            success_count = r[4] or 1
+            score = dist / (1.0 + 0.35 * math.log1p(success_count))
+            scored.append((score, r))
+        scored.sort(key=lambda x: x[0])
+
         return [
             {"id": r[0], "name": r[1], "description": r[2],
              "steps": json.loads(r[3]), "success_count": r[4], "distance": r[5]}
-            for r in rows
+            for _, r in scored[:k]
         ]
 
     def list_all(self) -> list[dict]:

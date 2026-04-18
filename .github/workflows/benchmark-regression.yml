@@ -1,0 +1,105 @@
+name: Benchmark Regression Gate
+
+# Runs a quick HumanEval subset on every PR. Blocks merges that drop the pass
+# rate below the agreed floor. Doesn't run the full suite (too slow for CI) —
+# use `benchmarks/humaneval/run.py --end-to-end` on a dedicated box for that.
+#
+# The CI run uses a hosted LLM (set via secret) because the local vLLM fleet
+# isn't available in GitHub runners. If no API key is configured, the job
+# short-circuits with a warning rather than failing.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'autonomous/**'
+      - 'benchmarks/**'
+      - 'pyproject.toml'
+
+  # Manual trigger for testing the workflow itself
+  workflow_dispatch:
+
+jobs:
+  humaneval-smoke:
+    name: HumanEval quick smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -e .
+          pip install human-eval datasets
+
+      - name: Check for LLM backend config
+        id: backend
+        run: |
+          if [ -n "${{ secrets.ANTHROPIC_API_KEY }}" ] || [ -n "${{ secrets.OPENAI_API_KEY }}" ] || [ -n "${{ secrets.ANVIL_LLM_BASE_URL }}" ]; then
+            echo "has_backend=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_backend=false" >> $GITHUB_OUTPUT
+            echo "::warning::no LLM backend configured; skipping benchmark smoke. Set ANTHROPIC_API_KEY / OPENAI_API_KEY / ANVIL_LLM_BASE_URL in repo secrets."
+          fi
+
+      - name: Run HumanEval smoke (20 tasks)
+        if: steps.backend.outputs.has_backend == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANVIL_LLM_BASE_URL: ${{ secrets.ANVIL_LLM_BASE_URL }}
+        run: |
+          mkdir -p benchmark_output/humaneval
+          python -m benchmarks.humaneval.run --fetch
+          # Sample 20 HumanEval tasks spread across difficulty
+          TASKS=$(python -c "print(','.join(f'HumanEval/{i*8}' for i in range(20)))")
+          python -m benchmarks.humaneval.run --predict --tasks "$TASKS" --workers 4 --timeout-sec 120
+
+      - name: Evaluate + check regression floor
+        if: steps.backend.outputs.has_backend == 'true'
+        run: |
+          python -m benchmarks.humaneval.run --evaluate
+          python - <<'PY'
+          import json, sys
+          from pathlib import Path
+          s = json.loads(Path("benchmark_output/humaneval/summary.json").read_text())
+          rate = float(s.get("pass_rate", "0%").rstrip("%"))
+          FLOOR = 80.0  # 20-task subset floor; full suite is 92.7%+
+          print(f"smoke pass rate: {rate:.1f}%  floor: {FLOOR:.1f}%")
+          if rate < FLOOR:
+              print(f"::error::Pass rate {rate:.1f}% fell below floor {FLOOR:.1f}%")
+              sys.exit(1)
+          PY
+
+      - name: Upload benchmark output
+        if: always() && steps.backend.outputs.has_backend == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: humaneval-smoke-output
+          path: benchmark_output/humaneval/
+          retention-days: 7
+
+  unit-tests:
+    name: Fast unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: pip install -e . pytest
+      - name: Import sanity
+        run: |
+          python -c "from autonomous.tools import REGISTRY; print('tools:', len(REGISTRY.names()))"
+          python -c "from autonomous.memory.embedder import info; print('embedder configured')"
+          python -c "from autonomous.safety.output_truncation import truncate_observation; print('truncation OK')"
+          python -c "from autonomous.safety.public_test_verifier import verify_public_tests; print('verifier OK')"
+          python -c "from autonomous.metrics import METRICS, classify_error; print('metrics OK')"
