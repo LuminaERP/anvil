@@ -60,7 +60,17 @@ MANDATORY DISCIPLINE — violations cause the reviewer to REJECT your work:
 
 7. **NO STUBS.** Tests with `pass`, `...`, or placeholder asserts (`assert True`, `assert result == True` where result is hardcoded True) are automatic failures.
 
-8. Emit a final text answer (no tool_calls) ONLY when steps 1-7 are satisfied."""
+8. **EDIT EXISTING, DON'T CREATE NEW.** When the goal is to fix a bug or resolve an issue in an existing codebase:
+   a. Your job is to MODIFY existing files, not to create new ones. Creating a reproduction script or a new test file is NOT a fix.
+   b. Use list_symbols(path) to navigate unfamiliar files before read_file — it's 50x cheaper on context.
+   c. Use read_symbol(path, name) to see just the relevant function, not the whole file.
+   d. Only create a new file if the goal explicitly says to create it (e.g., "write a new test suite named X").
+
+9. **CONTEXT ECONOMY.** Every tool observation goes into your context window. Don't read the whole file if you only need 20 lines — use read_file_range, list_symbols, or read_symbol. Don't list a huge directory — use glob_files with a specific pattern.
+
+10. **NO REPETITIONS.** If you just called a tool with specific arguments and got an observation, calling the exact same tool+arguments again wastes context. Either read the prior observation more carefully or try a different approach.
+
+11. Emit a final text answer (no tool_calls) ONLY when steps 1-10 are satisfied."""
 
 
 def _now() -> str:
@@ -102,9 +112,37 @@ def _format_user_turn(goal: str, subgoal: Subgoal, subgoals: list[Subgoal], memo
     return "\n".join(parts)
 
 
-def _run_tool(name: str, args: dict) -> ToolCall:
+_REPETITION_CACHE: dict[str, dict[str, str]] = {}  # session_id -> {args_hash: result}
+
+
+def _args_hash(name: str, args: dict) -> str:
+    import hashlib
+    import json
+    try:
+        key = f"{name}::{json.dumps(args, sort_keys=True, default=str)}"
+    except (TypeError, ValueError):
+        key = f"{name}::{args!r}"
+    return hashlib.sha1(key.encode()).hexdigest()[:16]
+
+
+def _run_tool(name: str, args: dict, session_id: str = "__default__") -> ToolCall:
     start = time.time()
     tc = ToolCall(name=name, args=args)
+
+    # Repetition detector: if the same (tool, args) was just called, short-circuit
+    # with a warning so the agent sees "you already did this".
+    session_cache = _REPETITION_CACHE.setdefault(session_id, {})
+    h = _args_hash(name, args)
+    if h in session_cache:
+        tc.result = (
+            f"[REPEAT DETECTED] You just called {name} with identical arguments. "
+            f"The prior observation was:\n"
+            f"---\n{session_cache[h][:1500]}\n---\n"
+            f"Do not call the same tool+args again; use the result above or try a different approach."
+        )
+        tc.duration_ms = int((time.time() - start) * 1000)
+        return tc
+
     try:
         tool = REGISTRY.get(name)
         tc.result = tool.fn(**args)
@@ -115,7 +153,28 @@ def _run_tool(name: str, args: dict) -> ToolCall:
     except Exception as e:
         tc.error = f"unexpected {type(e).__name__}: {e}"
     tc.duration_ms = int((time.time() - start) * 1000)
+
+    # Apply context-discipline truncation before this observation flows back
+    # into the executor's conversation. Short outputs pass through unchanged.
+    if tc.result:
+        try:
+            from ..safety.output_truncation import truncate_observation
+            tr = truncate_observation(name, args, tc.result)
+            if tr.truncated:
+                tc.result = tr.text
+        except Exception:
+            pass  # never break a tool call over a truncation hiccup
+
+    # Record successful calls in the repetition cache so repeats can be detected
+    if tc.result and not tc.error:
+        session_cache[h] = tc.result
+
     return tc
+
+
+def _reset_repetition_cache(session_id: str = "__default__") -> None:
+    """Called at subgoal boundaries so cache doesn't leak between subgoals."""
+    _REPETITION_CACHE.pop(session_id, None)
 
 
 def executor_node(state: AgentState) -> dict:
@@ -130,6 +189,9 @@ def executor_node(state: AgentState) -> dict:
     sg.attempts += 1
     fleet = CONFIG["fleet"]
     budget = CONFIG["budget"]
+
+    # Fresh repetition cache per subgoal; prior subgoal's observations don't count
+    _reset_repetition_cache(sg.id)
 
     # Small/cheap subgoals go to worker; reasoning-heavy to executor.
     ep = fleet.worker if sg.role == "worker" else fleet.executor
@@ -203,7 +265,7 @@ def executor_node(state: AgentState) -> dict:
                 obs = f"ERROR: invalid JSON arguments: {e}"
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": obs})
                 continue
-            run = _run_tool(tc.function.name, args)
+            run = _run_tool(tc.function.name, args, session_id=sg.id)
             all_tool_calls.append(run)
             obs = run.result if run.error is None else f"ERROR: {run.error}"
             # Truncate massive observations to protect context
